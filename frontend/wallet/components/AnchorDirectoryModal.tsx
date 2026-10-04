@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, type CSSProperties } from 'react'
+import { useEffect, useState, useRef, type CSSProperties } from 'react'
 
 interface AnchorDirectoryModalProps {
   isOpen: boolean
@@ -18,13 +18,24 @@ export function AnchorDirectoryModal({
   onComplete,
 }: AnchorDirectoryModalProps) {
   const [iframeLoading, setIframeLoading] = useState(true)
+  const iframeRef = useRef<HTMLIFrameElement>(null)
 
   useEffect(() => {
     if (!isOpen || !url) return
 
+    let expectedOrigin: string | null = null
+    try {
+      expectedOrigin = new URL(url).origin
+    } catch {
+      expectedOrigin = null
+    }
+
     // Listen for postMessage events from SEP-24 anchor flow (e.g. status: 'complete' / 'close')
     function handleMessage(event: MessageEvent) {
       if (!event.data) return
+      if (expectedOrigin && event.origin !== expectedOrigin) return
+      if (iframeRef.current && event.source !== iframeRef.current.contentWindow) return
+
       const data = typeof event.data === 'string' ? safeJsonParse(event.data) : event.data
       if (data && (data.type === 'sep24_complete' || data.status === 'completed')) {
         onComplete?.()
@@ -73,11 +84,12 @@ export function AnchorDirectoryModal({
             </div>
           )}
           <iframe
+            ref={iframeRef}
             src={url}
             title={title}
             style={iframeStyle}
             onLoad={() => setIframeLoading(false)}
-            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-top-navigation"
+            sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
           />
         </div>
       </div>
