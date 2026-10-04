@@ -1,58 +1,16 @@
-/**
- * Anchor directory & SEP-1 / SEP-6 / SEP-24 discovery engine for Veil wallet.
- * https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0001.md
- * https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md
- * https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md
- */
-
 import {
   Keypair,
   Networks,
-  Operation,
   StrKey,
   StellarToml,
-  Transaction,
-  TransactionBuilder,
 } from '@stellar/stellar-sdk'
-
-// ── Verified Asset Registry (Pinning Known Assets) ────────────────────────────
-
-export interface VerifiedAsset {
-  code: string
-  issuer: string
-  name: string
-  issuerName: string
-  homeDomain: string
-  kind: 'treasury' | 'fund' | 'equity' | 'stablecoin' | 'utility'
-}
-
-/** Pinned, verified assets on Stellar mainnet & testnet. */
-export const VERIFIED_ASSET_REGISTRY: Record<string, VerifiedAsset> = {
-  USDC: {
-    code: 'USDC',
-    issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335WFGCCHVTLF2CCZAK27ZQQ625',
-    name: 'USD Coin',
-    issuerName: 'Circle',
-    homeDomain: 'centre.io',
-    kind: 'stablecoin',
-  },
-  EURC: {
-    code: 'EURC',
-    issuer: 'GDHU6WR2KCEVDLWBVRWXZVH2AZ3ZX4BH4AXSSOQNTFQC2V3CQE37K3VC',
-    name: 'Euro Coin',
-    issuerName: 'Circle',
-    homeDomain: 'circle.com',
-    kind: 'stablecoin',
-  },
-  USDY: {
-    code: 'USDY',
-    issuer: 'GAJMPX5NBOG6TQFPQGRABJEEB2YE7RFRLUKJDZAZGAD5GFX4J7TADAZ6',
-    name: 'Ondo US Dollar Yield',
-    issuerName: 'Ondo Finance',
-    homeDomain: 'ondo.finance',
-    kind: 'treasury',
-  },
-}
+import {
+  ASSET_REGISTRY,
+  getRegisteredAsset,
+  isRegisteredIssuer,
+  type RegisteredAsset,
+} from './assets'
+import { getSep10Jwt, signSep10Challenge } from './sep24'
 
 // ── Types for Anchor Directory ────────────────────────────────────────────────
 
@@ -291,22 +249,24 @@ export async function parseAnchorToml(tomlText: string, domain: string): Promise
 
     if (!isIssuerValidKey) continue
 
-    // If TOML explicitly listed ACCOUNTS/ISSUERS, check if currency's issuer is declared there
-    const matchesTomlAccounts = accounts.length === 0 || (issuer ? accounts.includes(issuer) : true)
+    // If TOML explicitly listed ACCOUNTS/ISSUERS, check if currency's issuer is declared there.
+    // An empty ACCOUNTS list means unverified.
+    const matchesTomlAccounts = accounts.length > 0 && (issuer ? accounts.includes(issuer) : true)
 
     const isIssuerVerified = isIssuerValidKey && matchesTomlAccounts
 
     // Check against verified asset registry
-    const registryAsset = VERIFIED_ASSET_REGISTRY[code]
+    const registryAsset = getRegisteredAsset(code) || ASSET_REGISTRY[code.toUpperCase()]
     let isVerifiedRegistry = false
     let isImpersonating = false
     let verifiedIssuer: string | undefined = undefined
 
     if (registryAsset) {
       verifiedIssuer = registryAsset.issuer
-      if (issuer && issuer === registryAsset.issuer) {
+      if (issuer && isRegisteredIssuer(code, issuer)) {
         isVerifiedRegistry = true
-      } else if (issuer && issuer !== registryAsset.issuer) {
+        isImpersonating = false
+      } else if (issuer && !isRegisteredIssuer(code, issuer)) {
         isImpersonating = true
         isVerifiedRegistry = false
       }
@@ -402,7 +362,7 @@ export class HostileTomlInjectionError extends Error {
  */
 export function registerDiscoveredAsset(
   asset: DiscoveredCurrency,
-  registry: Record<string, VerifiedAsset> = VERIFIED_ASSET_REGISTRY,
+  registry: Record<string, RegisteredAsset> = ASSET_REGISTRY,
 ): boolean {
   if (!asset.isIssuerVerified) {
     throw new HostileTomlInjectionError(
@@ -431,8 +391,10 @@ export function registerDiscoveredAsset(
 export interface Sep10AuthOptions {
   webAuthEndpoint: string
   account: string
+  homeDomain?: string
+  anchorSigningKey?: string
   networkPassphrase?: string
-  signerKeypair: Keypair
+  signerKeypair?: Keypair
   fetchFn?: typeof fetch
 }
 
@@ -443,10 +405,23 @@ export interface Sep10AuthOptions {
 export async function authenticateSep10({
   webAuthEndpoint,
   account,
+  homeDomain,
+  anchorSigningKey,
   networkPassphrase = Networks.TESTNET,
   signerKeypair,
   fetchFn = fetch,
 }: Sep10AuthOptions): Promise<string> {
+  if (!signerKeypair) {
+    return getSep10Jwt(
+      webAuthEndpoint,
+      account,
+      networkPassphrase,
+      homeDomain,
+      anchorSigningKey,
+      fetchFn,
+    )
+  }
+
   // 1. Fetch challenge
   const challengeUrl = `${webAuthEndpoint}?account=${encodeURIComponent(account)}`
   const challengeRes = await fetchFn(challengeUrl, { signal: AbortSignal.timeout(10_000) })
@@ -464,37 +439,25 @@ export async function authenticateSep10({
     throw new Error('Anchor challenge response missing transaction XDR')
   }
 
-  const effectivePassphrase = network_passphrase || networkPassphrase
-
-  // 2. Parse & sign challenge
-  let tx: Transaction
-  try {
-    tx = new Transaction(challengeXdr, effectivePassphrase)
-  } catch (err) {
-    throw new Error(`Failed to parse SEP-10 challenge XDR: ${(err as Error).message}`)
+  if (network_passphrase && network_passphrase !== networkPassphrase) {
+    throw new Error(
+      `Anchor returned network_passphrase "${network_passphrase}" which differs from expected "${networkPassphrase}"`,
+    )
   }
 
-  // SEP-10 validation checks
-  const manageDataOps = tx.operations.filter(
-    (op): op is Operation.ManageData => op.type === 'manageData',
+  const webAuthDomain = webAuthEndpoint.startsWith('http')
+    ? new URL(webAuthEndpoint).hostname
+    : undefined
+
+  // 2. Validate and sign using SDK WebAuth
+  const signedXdr = signSep10Challenge(
+    challengeXdr,
+    networkPassphrase,
+    signerKeypair,
+    homeDomain,
+    anchorSigningKey,
+    webAuthDomain,
   )
-  if (manageDataOps.length === 0) {
-    throw new Error('SEP-10 challenge must contain at least one manage_data operation')
-  }
-
-  if (!tx.timeBounds) {
-    throw new Error('SEP-10 challenge must have timeBounds set')
-  }
-
-  const nowSec = Math.floor(Date.now() / 1000)
-  const maxTime = Number(tx.timeBounds.maxTime)
-  if (maxTime > 0 && nowSec > maxTime) {
-    throw new Error(`SEP-10 challenge has expired (maxTime=${maxTime}, now=${nowSec})`)
-  }
-
-  const rebuilt = TransactionBuilder.cloneFrom(tx).build()
-  rebuilt.sign(signerKeypair)
-  const signedXdr = rebuilt.toXDR()
 
   // 3. Post back ONLY transaction XDR for JWT (zero user data transmitted)
   const tokenRes = await fetchFn(webAuthEndpoint, {

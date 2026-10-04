@@ -15,6 +15,7 @@ import {
   Transaction,
   Keypair,
   Operation,
+  WebAuth,
 } from '@stellar/stellar-sdk'
 import { derToRawSignature, hexToUint8Array } from '@veil/utils'
 import { walletLocal, walletSession } from '@/lib/walletStorage'
@@ -92,25 +93,15 @@ export class Sep10ChallengeError extends Error {
 }
 
 /**
- * Validate and sign a SEP-10 challenge transaction.
- *
- * SEP-10 rules enforced:
- *  - The transaction MUST contain at least one `manage_data` operation.
- *  - The `manage_data` key MUST end with " auth" (the standard anchor suffix).
- *  - The transaction MUST have `timeBounds` set (minTime / maxTime).
- *  - `maxTime` MUST be in the future (challenge not expired).
- *
- * @param challengeXdr     Base64-encoded XDR of the challenge transaction.
- * @param networkPassphrase Stellar network passphrase used to parse & hash the tx.
- * @param signerKeypair    Keypair of the user account that signs the challenge.
- * @returns Signed transaction XDR ready to POST back to the anchor.
- * @throws {Sep10ChallengeError} if any SEP-10 validation rule is violated.
+ * Validate a SEP-10 challenge transaction using standard SDK WebAuth rules.
  */
-export function signSep10Challenge(
+export function validateSep10Challenge(
   challengeXdr: string,
   networkPassphrase: string,
-  signerKeypair: Keypair,
-): string {
+  homeDomain?: string,
+  anchorSigningKey?: string,
+  webAuthDomain?: string,
+): { tx: Transaction; clientAccountID: string; matchedHomeDomain: string } {
   let tx: Transaction
   try {
     tx = new Transaction(challengeXdr, networkPassphrase)
@@ -121,7 +112,6 @@ export function signSep10Challenge(
     )
   }
 
-  // ── 1. Must have at least one manage_data op ────────────────────────────────
   const manageDataOps = tx.operations.filter(
     (op): op is Operation.ManageData => op.type === 'manageData',
   )
@@ -132,7 +122,6 @@ export function signSep10Challenge(
     )
   }
 
-  // ── 2. First manage_data key must follow "<home_domain> auth" convention ────
   const firstKey = manageDataOps[0].name
   if (!firstKey.endsWith(' auth')) {
     throw new Sep10ChallengeError(
@@ -141,7 +130,6 @@ export function signSep10Challenge(
     )
   }
 
-  // ── 3. Must have time bounds ────────────────────────────────────────────────
   if (!tx.timeBounds) {
     throw new Sep10ChallengeError(
       'SEP-10 challenge must have timeBounds set',
@@ -149,7 +137,6 @@ export function signSep10Challenge(
     )
   }
 
-  // ── 4. Challenge must not have expired ─────────────────────────────────────
   const nowSec = Math.floor(Date.now() / 1000)
   const maxTime = Number(tx.timeBounds.maxTime)
   if (maxTime > 0 && nowSec > maxTime) {
@@ -159,7 +146,66 @@ export function signSep10Challenge(
     )
   }
 
-  // ── Sign and return ─────────────────────────────────────────────────────────
+  const expectedHomeDomain = homeDomain || firstKey.slice(0, -5)
+  const serverAccountID = anchorSigningKey || tx.source
+
+  try {
+    const readResult = WebAuth.readChallengeTx(
+      challengeXdr,
+      serverAccountID,
+      networkPassphrase,
+      expectedHomeDomain,
+      webAuthDomain || '',
+    )
+    return readResult
+  } catch (err) {
+    const msg = (err as Error).message || String(err)
+    if (msg.includes('expired') || msg.includes('timebounds')) {
+      throw new Sep10ChallengeError(msg, 'EXPIRED')
+    } else if (msg.includes('home domain') || msg.includes('homeDomains')) {
+      throw new Sep10ChallengeError(msg, 'INVALID_HOME_DOMAIN')
+    } else if (msg.includes('manageData') || msg.includes('operation')) {
+      throw new Sep10ChallengeError(msg, 'MISSING_MANAGE_DATA')
+    }
+    throw new Sep10ChallengeError(msg, 'MALFORMED')
+  }
+}
+
+/**
+ * Validate and sign a SEP-10 challenge transaction.
+ *
+ * SEP-10 rules enforced:
+ *  - The transaction MUST contain at least one `manage_data` operation.
+ *  - The `manage_data` key MUST end with " auth" (the standard anchor suffix).
+ *  - The transaction MUST have `timeBounds` set (minTime / maxTime).
+ *  - `maxTime` MUST be in the future (challenge not expired).
+ *  - Enforces sequence number 0 and server signature via WebAuth.readChallengeTx.
+ *
+ * @param challengeXdr     Base64-encoded XDR of the challenge transaction.
+ * @param networkPassphrase Stellar network passphrase used to parse & hash the tx.
+ * @param signerKeypair    Keypair of the user account that signs the challenge.
+ * @param homeDomain       Optional home domain to verify.
+ * @param anchorSigningKey Optional server signing key to verify.
+ * @param webAuthDomain    Optional web auth domain to verify.
+ * @returns Signed transaction XDR ready to POST back to the anchor.
+ * @throws {Sep10ChallengeError} if any SEP-10 validation rule is violated.
+ */
+export function signSep10Challenge(
+  challengeXdr: string,
+  networkPassphrase: string,
+  signerKeypair: Keypair,
+  homeDomain?: string,
+  anchorSigningKey?: string,
+  webAuthDomain?: string,
+): string {
+  const { tx } = validateSep10Challenge(
+    challengeXdr,
+    networkPassphrase,
+    homeDomain,
+    anchorSigningKey,
+    webAuthDomain,
+  )
+
   const rebuilt = TransactionBuilder.cloneFrom(tx).build()
   rebuilt.sign(signerKeypair)
   return rebuilt.toXDR()
@@ -180,9 +226,12 @@ export async function getSep10Jwt(
   webAuthEndpoint: string,
   account: string,
   networkPassphrase: string,
+  homeDomain?: string,
+  anchorSigningKey?: string,
+  fetchFn: typeof fetch = fetch,
 ): Promise<string> {
   // Step 1: fetch challenge
-  const challengeRes = await fetch(
+  const challengeRes = await fetchFn(
     `${webAuthEndpoint}?account=${encodeURIComponent(account)}`,
     { signal: AbortSignal.timeout(10_000) },
   )
@@ -192,13 +241,33 @@ export async function getSep10Jwt(
   }
   const { transaction: challengeXdr, network_passphrase } = await challengeRes.json() as {
     transaction: string
-    network_passphrase: string
+    network_passphrase?: string
   }
 
-  const effectivePassphrase = network_passphrase ?? networkPassphrase
+  if (!challengeXdr) {
+    throw new Error('Anchor challenge response missing transaction XDR')
+  }
+
+  if (network_passphrase && network_passphrase !== networkPassphrase) {
+    throw new Error(
+      `Anchor returned network_passphrase "${network_passphrase}" which differs from expected "${networkPassphrase}"`,
+    )
+  }
+
+  const webAuthDomain = webAuthEndpoint.startsWith('http')
+    ? new URL(webAuthEndpoint).hostname
+    : undefined
+
+  validateSep10Challenge(
+    challengeXdr,
+    networkPassphrase,
+    homeDomain,
+    anchorSigningKey,
+    webAuthDomain,
+  )
 
   // Step 2: sign with passkey
-  const tx = new Transaction(challengeXdr, effectivePassphrase)
+  const tx = new Transaction(challengeXdr, networkPassphrase)
   const txHash = tx.hash() // 32-byte Buffer
 
   const keyId        = walletLocal.getItem('invisible_wallet_key_id')
@@ -251,7 +320,7 @@ export async function getSep10Jwt(
   void publicKeyBytes; void rawSig; void authData; void clientDataJSON // used above, kept for clarity
 
   // Step 3: exchange signed transaction for JWT
-  const tokenRes = await fetch(webAuthEndpoint, {
+  const tokenRes = await fetchFn(webAuthEndpoint, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ transaction: signedXdr }),
