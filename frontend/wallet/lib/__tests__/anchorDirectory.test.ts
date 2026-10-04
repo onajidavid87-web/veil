@@ -1,4 +1,5 @@
 import { TextEncoder, TextDecoder } from 'util'
+import crypto from 'crypto'
 Object.assign(globalThis, { TextEncoder, TextDecoder })
 
 import { Keypair, Networks, TransactionBuilder, Account, Operation } from '@stellar/stellar-sdk'
@@ -7,15 +8,15 @@ import {
   registerDiscoveredAsset,
   authenticateSep10,
   HostileTomlInjectionError,
-  VERIFIED_ASSET_REGISTRY,
   isValidStellarPublicKey,
   isValidAssetCode,
   type DiscoveredCurrency,
 } from '../anchorDirectory'
+import { ASSET_REGISTRY } from '../assets'
 
 const VALID_ISSUER_1 = Keypair.random().publicKey()
 const VALID_ISSUER_2 = Keypair.random().publicKey()
-const ONDO_USDY_ISSUER = VERIFIED_ASSET_REGISTRY.USDY.issuer
+const ONDO_USDY_ISSUER = ASSET_REGISTRY.USDY.issuer
 
 describe('isValidStellarPublicKey', () => {
   it('validates Ed25519 public keys', () => {
@@ -64,6 +65,31 @@ code = "XLM"
     const xlm = info.currencies.find((c) => c.code === 'XLM')
     expect(xlm).toBeDefined()
     expect(xlm?.isIssuerVerified).toBe(true)
+  })
+
+  it('does not mark currency as verified when ACCOUNTS list is empty', async () => {
+    const emptyAccountsToml = `
+ACCOUNTS = []
+
+[[CURRENCIES]]
+code = "TOKEN1"
+issuer = "${VALID_ISSUER_1}"
+`
+    const info = await parseAnchorToml(emptyAccountsToml, 'example.com')
+    const token1 = info.currencies.find((c) => c.code === 'TOKEN1')
+    expect(token1?.isIssuerVerified).toBe(false)
+  })
+
+  it('recognizes genuine Circle USDC without impersonation warning', async () => {
+    const circleUsdcToml = `
+[[CURRENCIES]]
+code = "USDC"
+issuer = "${ASSET_REGISTRY.USDC.issuer}"
+`
+    const info = await parseAnchorToml(circleUsdcToml, 'circle.com')
+    const usdc = info.currencies[0]
+    expect(usdc.isVerifiedRegistry).toBe(true)
+    expect(usdc.isImpersonating).toBe(false)
   })
 
   it('detects and flags hostile impersonation of pinned verified assets', async () => {
@@ -163,16 +189,17 @@ describe('authenticateSep10', () => {
   const webAuthEndpoint = 'https://testanchor.stellar.org/auth'
 
   it('authenticates against testnet anchor using user key and receives JWT', async () => {
-    // Build mock challenge tx
-    const account = new Account(userKp.publicKey(), '0')
+    // Build mock challenge tx matching WebAuth rules
+    const account = new Account(anchorKp.publicKey(), '-1')
     const challengeTx = new TransactionBuilder(account, {
       fee: '100',
       networkPassphrase: Networks.TESTNET,
     })
       .addOperation(
         Operation.manageData({
+          source: userKp.publicKey(),
           name: 'testanchor.stellar.org auth',
-          value: 'randomnonce',
+          value: crypto.randomBytes(48).toString('base64'),
         }),
       )
       .setTimeout(300)
@@ -206,6 +233,8 @@ describe('authenticateSep10', () => {
     const token = await authenticateSep10({
       webAuthEndpoint,
       account: userKp.publicKey(),
+      homeDomain: 'testanchor.stellar.org',
+      anchorSigningKey: anchorKp.publicKey(),
       networkPassphrase: Networks.TESTNET,
       signerKeypair: userKp,
       fetchFn: mockFetch as unknown as typeof fetch,
