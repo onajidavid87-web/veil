@@ -2,19 +2,16 @@
 
 import { useState, useEffect, useCallback, type CSSProperties } from 'react'
 import { useRouter } from 'next/navigation'
-import { Keypair } from '@stellar/stellar-sdk'
 
 import { useInactivityLock } from '@/hooks/useInactivityLock'
 import { getNetwork } from '@/lib/network'
 import { walletLocal, walletSession } from '@/lib/walletStorage'
 import {
   fetchAnchorToml,
-  authenticateSep10,
-  VERIFIED_ASSET_REGISTRY,
   type DiscoveredAnchorInfo,
   type DiscoveredCurrency,
 } from '@/lib/anchorDirectory'
-import { initiateDeposit, initiateWithdraw } from '@/lib/sep24'
+import { initiateDeposit, initiateWithdraw, getSep10Jwt } from '@/lib/sep24'
 import { AnchorDirectoryModal } from '@/components/AnchorDirectoryModal'
 
 const FEATURED_ANCHORS = ['testanchor.stellar.org', 'ondo.finance', 'centre.io']
@@ -38,26 +35,15 @@ export default function InvestPage() {
   const [accountAddress, setAccountAddress] = useState<string | null>(null)
 
   useEffect(() => {
-    const addr = walletSession.getItem('invisible_wallet_address')
+    const addr =
+      walletSession.getItem('invisible_wallet_address') ||
+      walletLocal.getItem('invisible_wallet_public_key')
     if (!addr) {
       router.replace('/lock')
       return
     }
 
-    const signerSecret =
-      walletSession.getItem('veil_signer_secret') || walletLocal.getItem('veil_signer_secret')
-    const signerPublic = walletLocal.getItem('veil_signer_public_key')
-
-    if (!signerSecret && !signerPublic) {
-      setErrorMsg('Signing key not found. Please unlock your wallet.')
-      return
-    }
-
-    const resolvedAddress = signerSecret
-      ? Keypair.fromSecret(signerSecret).publicKey()
-      : signerPublic!
-
-    setAccountAddress(resolvedAddress)
+    setAccountAddress(addr)
     void handleDiscover(domainInput)
   }, [router])
 
@@ -80,35 +66,24 @@ export default function InvestPage() {
     async (asset: DiscoveredCurrency, mode: 'deposit' | 'withdraw') => {
       if (!anchorInfo) return
       setErrorMsg(null)
-      setStatusMsg(`Authenticating with ${anchorInfo.homeDomain} via SEP-10…`)
-
-      const signerSecret =
-        walletSession.getItem('veil_signer_secret') || walletLocal.getItem('veil_signer_secret')
-
-      if (!signerSecret) {
-        setErrorMsg('Secret key required for SEP-10 signing. Unlock wallet again.')
-        setStatusMsg(null)
-        return
-      }
 
       if (!accountAddress) {
-        setErrorMsg('Account address not found.')
-        setStatusMsg(null)
+        setErrorMsg('Account address not found. Unlock wallet again.')
         return
       }
 
       try {
-        const userKp = Keypair.fromSecret(signerSecret)
         const webAuthEndpoint = anchorInfo.webAuthEndpoint
 
         let jwt: string | undefined = undefined
         if (webAuthEndpoint) {
-          jwt = await authenticateSep10({
+          setStatusMsg(`Authenticating with ${anchorInfo.homeDomain} via SEP-10…`)
+          jwt = await getSep10Jwt(
             webAuthEndpoint,
-            account: accountAddress,
-            networkPassphrase: anchorInfo.networkPassphrase || network.networkPassphrase,
-            signerKeypair: userKp,
-          })
+            accountAddress,
+            anchorInfo.networkPassphrase || network.networkPassphrase,
+            anchorInfo.homeDomain,
+          )
         }
 
         const transferServer = anchorInfo.transferServerSep24
