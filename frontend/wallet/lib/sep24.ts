@@ -115,6 +115,21 @@ export function validateSep10Challenge(
   const manageDataOps = tx.operations.filter(
     (op): op is Operation.ManageData => op.type === 'manageData',
   )
+
+  if (tx.sequence !== '0') {
+    throw new Sep10ChallengeError(
+      'SEP-10 challenge sequence number must be zero',
+      'MALFORMED',
+    )
+  }
+
+  if (!tx.operations.every((op) => op.type === 'manageData')) {
+    throw new Sep10ChallengeError(
+      'SEP-10 challenge must contain only manage_data operations',
+      'MISSING_MANAGE_DATA',
+    )
+  }
+
   if (manageDataOps.length === 0) {
     throw new Sep10ChallengeError(
       'SEP-10 challenge must contain at least one manage_data operation',
@@ -159,12 +174,13 @@ export function validateSep10Challenge(
     )
     return readResult
   } catch (err) {
+    if (err instanceof Sep10ChallengeError) throw err
     const msg = (err as Error).message || String(err)
     if (msg.includes('expired') || msg.includes('timebounds')) {
       throw new Sep10ChallengeError(msg, 'EXPIRED')
     } else if (msg.includes('home domain') || msg.includes('homeDomains')) {
       throw new Sep10ChallengeError(msg, 'INVALID_HOME_DOMAIN')
-    } else if (msg.includes('manageData') || msg.includes('operation')) {
+    } else if (msg.includes('manageData') || msg.includes('operation') || msg.includes('sequence')) {
       throw new Sep10ChallengeError(msg, 'MISSING_MANAGE_DATA')
     }
     throw new Sep10ChallengeError(msg, 'MALFORMED')
